@@ -1,0 +1,316 @@
+---
+title: "DADA2 template pipeline"
+author: "Simon Yersin"
+date: '2022-03-08'
+output: html_document
+---
+This is a R MarkDown if you do not know how to use it, look for a tutorial online
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Starting point
+Our starting point is a set of Illumina-sequenced paired-end fastq files that have been split (or “demultiplexed”) by sample and from which the barcodes/adapters have already been removed
+The end product is an amplicon sequence variant (ASV) table, a higher-resolution analogue of the traditional OTU table, which records the number of times each exact amplicon sequence variant was observed in each sample
+We also assign taxonomy to the output sequences, and demonstrate how the data can be imported into the popular phyloseq R package for the analysis of microbiome data
+
+This workflow assumes that your sequencing data meets certain criteria:
+Samples have been demultiplexed, i.e. split into individual per-sample fastq files.
+Non-biological nucleotides have been removed, e.g. primers, adapters, linkers, etc.
+If paired-end sequencing data, the forward and reverse fastq files contain reads in matched order.
+
+IF single library, remove the reverse read and do not merge (see DADA2 template_SingleReads.Rmd)
+
+From:
+https://benjjneb.github.io/dada2/tutorial_1_8.html
+
+
+
+# Loading libraries
+```{r}
+# if not installed on your R studio run the folowing commands:
+# if (!require("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+#BiocManager::install(version = "3.15")
+#BiocManager::install("dada2")
+
+# Then load library
+library(dada2)
+
+
+```
+
+# Working directory and path
+```{r}
+# Set your working directory
+# First check which wd you are working in with
+# Usually it should be the directory where the R file is saved
+getwd()
+# Copy and paste path in the following to set your working directory:
+setwd("/Users/julian/Documents/1A_POST_DOC_LAUSANNE_2022/14_ALINE_MASTER/1A_MOUSE_EXPERIMENTS/NOVOGEN_16S/R_ANALYSIS/SEQUENCES")
+
+# Save path to fastq file folder after unzipping
+path <- "/Users/julian/Documents/1A_POST_DOC_LAUSANNE_2022/14_ALINE_MASTER/1A_MOUSE_EXPERIMENTS/NOVOGEN_16S/R_ANALYSIS/SEQUENCES"
+# Control files
+list.files(path)
+```
+
+# Upload files
+```{r}
+# Check for specific name/patterns in fastq for forward and reverse read
+# Example fnFs: R1_001.fastq.gz fnRs: R2_001.fastq.gz
+fnFs <- sort(list.files(path, pattern="_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_2.fastq.gz", full.names = TRUE))
+
+# Extract sample names
+# See files for pattern, ex from AFRIBIOTA fastq: _L001
+sample.namesF<- sapply(strsplit(basename(fnFs), "_1.fastq.gz"), `[`, 1)
+sample.namesR <- sapply(strsplit(basename(fnRs), "_2.fastq.gz"), `[`, 1)
+
+#Verify if same number of forward and reverse:
+length(fnFs) 
+length(fnRs)
+```
+#Function
+#for keeping track of read retained during the different steps
+```{r}
+getN <- function(x) sum(getUniques(x))
+```
+
+# Quality plots
+```{r}
+# plot quality profiles of the forward and reverse reads 
+# Time consuming, plot only a few
+plotQualityProfile(fnFs[1:4]) 
+plotQualityProfile(fnRs[1:4])
+# Allow to check where to truncate
+# Quality score lower than 30 is a good place to truncate
+```
+
+# Filter and trim
+```{r}
+# Place filter files in filtered subdirectory
+filtFs <- file.path(path, "dada2_filtered", paste0(sample.namesF, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "dada2_filtered", paste0(sample.namesR, "_R_filt.fastq.gz"))
+
+names(filtFs) <- sample.namesF
+names(filtRs) <- sample.namesR
+
+# Check parameters
+# the more aggressive you are with truncation, the more reads will be retained,
+# but you still need to merge, so consider how much read overlap remains after truncation
+# (Might have to remove verbose and MatchIDs)
+# If no truncation need, remove truncLen
+# maxEE is max expected error, after truncation reads with higher than maxEE will be discarded 
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     maxN=0, maxEE=c(6,8), truncQ=c(2,2),
+                     rm.phix=TRUE, verbose=TRUE, matchIDs=TRUE,
+                     compress=TRUE, multithread=TRUE) 
+# Check retained reads
+retained <- as.data.frame(out)
+retained$percentage_retained <- retained$reads.out/retained$reads.in*100
+rownames(retained) <-  sample.namesF
+View(retained)
+# If less than 80% of the reads are retained in all your samples, suspect something and change the parameters in filterAndTrim
+write.csv(retained, "retained.csv",row.names = TRUE)
+
+# Or check quality profile again
+#plotQualityProfile(filtFs[1:4])
+#plotQualityProfile(filtRs[1:4])
+```
+
+# Error rate
+```{r}
+#Learn error rates
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+#Plot error (visualize the estimated error rates)
+plotErrors(errF, nominalQ=TRUE)
+#Black line should fir more or less the red line
+```
+
+# Dereplication
+```{r}
+# Combine identical sequencing reads into unique sequences with a corresponding abundance equal to the number of reads with that unique sequence
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.namesF
+names(derepRs) <- sample.namesR
+```
+
+# Sample inference
+```{r}
+#DADA2 infers sample sequences exactly and resolves differences of as little as 1 nucleotide
+
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+
+#Inspecting the returned dada-class object:
+dadaFs[[1]]
+dadaRs[[1]]
+
+track_all <- cbind(sapply(derepFs, getN),
+                        sapply(derepRs, getN),
+                        sapply(dadaFs, getN),
+                        sapply(dadaRs, getN))
+```
+
+#Remove low-sequence sample
+```{r}
+# Example of simple method used above after the filter and trim step. if you already did this but still got an error when merging, try the steps below
+# samples_to_keep <- as.numeric(out[,"reads.out"]) > 100
+
+# Keeping track of read retention, number of unique sequences after ASV inference
+track <- cbind(sapply(derepFs, getN), sapply(derepRs, getN), sapply(dadaFs, getN), sapply(dadaRs, getN))
+samples_to_keep <- track[,4] > 100 #your threshold. try different ones to get the lowest one that will work. 
+#this method accounts for dereplication/ASVs left after inference
+```
+
+# Merging
+```{r}
+# Merge forward and reverse reads to obtain the full denoised sequences
+# Skip this step if using fastq with only forward reads
+mergers <- mergePairs(dadaFs[samples_to_keep], derepFs[samples_to_keep], dadaRs[samples_to_keep], derepRs[samples_to_keep], verbose=TRUE)
+
+
+# The mergers object is a list of data.frames from each sample. 
+# Each data.frame contains the merged $sequence, its $abundance, and the indices of the $forward and $reverse sequence variants that were merged. 
+
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+track <- cbind(sapply(derepFs[samples_to_keep], getN),
+                   sapply(derepRs[samples_to_keep], getN),
+                  sapply(dadaFs[samples_to_keep], getN), 
+                  sapply(dadaRs[samples_to_keep], getN),
+                  sapply(mergers, getN))
+```
+
+# Construct sequence table
+```{r}
+seqtab <- makeSequenceTable(mergers)
+write.table(seqtab, "seqtab.txt", sep="\t", quote=F, row.names=T, col.names=T)
+
+  #Check table dimension
+dim(seqtab)
+
+## If different datasets (fastq files from different studies) are used, 
+# the above pipeline need to be done for each dataset separatly
+# Then the seqtab can be merged with: 
+#seqtab <- mergeSequenceTables(seqtab_1, seqtab_2, seqtab_3)
+
+
+################################################################################################
+########## OR IF FILES HAVE BEEN SAVED AS TABLE (TSV) AND ARE NOT R OBJECTS ANYMORE
+################################################################################################
+
+
+# Load necessary library
+library(dada2)
+
+# Read the TSV files into R
+seq_table1 <- read.table("path_to_your_first_file.tsv", header = TRUE, sep = "\t", row.names = 1)
+seq_table2 <- read.table("path_to_your_second_file.tsv", header = TRUE, sep = "\t", row.names = 1)
+
+# Convert the data frames to matrix format (required by DADA2)
+seq_table1 <- as.matrix(seq_table1)
+seq_table2 <- as.matrix(seq_table2)
+
+# Merge the sequence tables
+seqtab <- mergeSequenceTables(seq_table1, seq_table2)
+
+# Optionally, save the merged sequence table to a file
+write.table(merged_seq_table, "merged_sequence_table.tsv", sep = "\t", col.names = NA, quote = FALSE)
+
+# Print the merged sequence table to check
+print(merged_seq_table)
+
+################################################################################################
+# THEN YOU CAN GO ON WITH THE REST OF THE PROCEDURE
+################################################################################################
+
+
+# then the rest of the pipeline can be done on the merged seqtab
+```
+
+# Remove chimeras
+```{r}
+# Here we remove "bimeras" or chimeras with two sources
+# look at "method" to decide which type of pooling you'd like to use when judging each sequence as chimeric or non-chimeric
+# Possible methods: "consensus" ; "pooled"
+#this step can take a few minutes to a few hours, depending on the size of your datas
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE) 
+
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab) 
+# Proportion of nonchimeras 
+ # it should be relatively high after filtering out your singletons/low-count ASVs, even if you lose a lot of ASVs
+# the number of reads lost should be quite low
+
+# Save sequence table
+write.table(seqtab.nochim, "sequence_table.txt", sep="\t", quote=F, row.names=T, col.names=T)
+```
+
+# Track reads
+```{r}
+# Look at the number of reads that made it through each step in the pipeline
+track <- cbind(retained[samples_to_keep,], track,
+              rowSums(seqtab.nochim))
+
+
+# Adding percent_chimeras in track
+track <- cbind(track, 100-track[,9]/track[,8]*100)
+colnames(track) <- c("input", "filtered","retained","derepF", "derepR", "denoisedF", "denoisedR", "merged",
+                     "nochimeras", "percent_chimeras")
+
+#rownames(track) <- sample.namesF[samples_to_keep]
+
+# Save read retention table
+write.table(track, "read_retention_table.txt", quote=F, row.names=T, col.names=T, sep="\t")
+
+```
+
+# Assign taxonomy
+```{r}
+# Note: time consuming if you have a large dataset
+  # Saving the sequences as a fasta file (with writeFasta) and using QIIME's taxonomy assignment command will save you time
+  # Slightly less accurate than the dada2 package's taxonomy assignment function.
+# Using the Silva database
+
+# Silva database: https://benjjneb.github.io/dada2/training.html
+# download the silva_nr99_v138.1_train_set.fa.gz
+# Or the train set with Species: silva_nr99_v138.1_wSpecies_train_set.fa.gz
+# Or latest version of the database
+taxa <- assignTaxonomy(seqtab.nochim, "/Users/julian/Bioinfo_Local/SILVA_DATABASE_STUFF/silva_nr99_v138.1_wSpecies_train_set.fa.gz", multithread=TRUE)
+
+# Optional: The dada2 package also implements a method to make species level assignments based on exact matching between ASVs and sequenced reference strains. Recent analysis suggests that exact matching (or 100% identity) is the only appropriate way to assign species to 16S gene fragments. Currently, species-assignment training fastas are available for the Silva and RDP 16S databases. To follow the optional species addition step, download the silva_species_assignment_v132.fa.gz file, and place it in the directory with the fastq files. Using: taxa <- addSpecies(taxa, "~/tax/silva_species_assignment_v132.fa.gz")
+
+# Inspect taxonomy table
+# NA taxa are hard to separate later if they have no label; apply "Unassigned" label here now
+# Possible labels here: eukaryotic, archaeal, bacterial, and "NA" taxa
+unique(taxa[,1])  
+#test for NA
+NAs <- is.na(taxa[,1]) 
+# Get indices of NA values
+NAs <- which(NAs == TRUE) 
+# Apply new label to identified indices
+taxa[NAs,1] <- "Unassigned" 
+
+#colnames(taxa) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+# Or other possible col names:
+#colnames(taxa) <- c("Rank1", "Rank2", "Rank3", "Rank4", "Rank5", "Rank6", "Rank7", "Accession")
+
+#head[taxa.print]
+
+# Save taxonomy table
+write.table(taxa, "taxonomy.txt", sep="\t", quote=F, row.names=T, col.names=T)
+
+### Good job you made it ###
+```
+
+Saving the tables allows to separate the processing of the sequences using DADA2 and the analysis
+See analysis template file for the next steps
